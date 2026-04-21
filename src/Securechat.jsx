@@ -425,7 +425,7 @@ export default function SecureChat() {
       setFp(fingerprint);
 
       const channel = await hashRoom(roomId.trim());
-      const ws = new WebSocket(`wss://socketsbay.com/wss/v2/1/${channel}/`);
+      const ws = new WebSocket(`wss://ws.postman-echo.com/raw`;
       wsRef.current = ws;
 
       ws.onopen = async () => {
