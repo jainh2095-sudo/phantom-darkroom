@@ -124,7 +124,7 @@ export default function SecureChat() {
     }
 
     const channel = await hashRoomId(roomId.trim());
-    const wsUrl = `wss://socketsbay.com/wss/v2/1/${channel}/`;
+    const wsUrl = `wss://ws.postman-echo.com/raw`;
 
     let ws;
     try { ws = new WebSocket(wsUrl); }
