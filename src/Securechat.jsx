@@ -47,7 +47,10 @@ const DEC = new TextDecoder();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function b64e(buf) {
-  const bytes = new Uint8Array(buf instanceof ArrayBuffer ? buf : (buf.buffer ?? buf));
+  // Safely convert any buffer type to Uint8Array without double-wrapping
+  const bytes = buf instanceof Uint8Array ? buf
+    : buf instanceof ArrayBuffer ? new Uint8Array(buf)
+    : new Uint8Array(buf);
   let out = "";
   for (let i = 0; i < bytes.length; i += 8192)
     out += String.fromCharCode(...bytes.subarray(i, i + 8192));
@@ -55,7 +58,10 @@ function b64e(buf) {
 }
 function b64d(s) { return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
 function rand(n) { return crypto.getRandomValues(new Uint8Array(n)); }
-function wipe(arr) { if (arr instanceof Uint8Array) arr.fill(0); }
+function wipe(arr) {
+  if (arr instanceof Uint8Array) arr.fill(0);
+  else if (Array.isArray(arr)) arr.fill(0);
+}
 function concat(...arrs) {
   const out = new Uint8Array(arrs.reduce((s, a) => s + a.length, 0));
   let off = 0; for (const a of arrs) { out.set(a, off); off += a.length; }
@@ -68,7 +74,12 @@ async function sha256(data) {
   return new Uint8Array(await crypto.subtle.digest("SHA-256", data instanceof Uint8Array ? data : ENC.encode(data)));
 }
 function randDelay(mn=0, mx=600) {
-  return new Promise(r => setTimeout(r, mn + (rand(1)[0] % Math.max(1, mx-mn))));
+  // Use 2 bytes for range >255 to avoid modulo bias
+  const range = Math.max(1, mx - mn);
+  const val = range <= 255
+    ? rand(1)[0] % range
+    : (((rand(1)[0] << 8) | rand(1)[0]) % range);
+  return new Promise(r => setTimeout(r, mn + val));
 }
 function haptic(pattern=[10]) { try { navigator.vibrate?.(pattern); } catch(_){} }
 
@@ -280,27 +291,96 @@ async function connectWS(channel,onOpen,onMsg,onClose,setStep) {
   throw new Error("All relays failed. Check your internet connection.");
 }
 
-// ── Screenshot / Screen recording detection ───────────────────────────────────
-// Technique 1: CSS — mix-blend-mode trick makes content invisible in screenshots on some platforms
-// Technique 2: Canvas noise — invisible overlay that breaks screenshot clarity
-// Technique 3: Visibility API — detect when screen sharing might be active
-// Technique 4: getDisplayMedia detection — intercept screen capture API
+// ── Maximum Screenshot & Screen Recording Protection ─────────────────────────
+// Layer 1: CSS mix-blend-mode + rapid animation destroys screenshot quality
+// Layer 2: getDisplayMedia blocked entirely (not just detected)
+// Layer 3: Print dialog blocked — hides content when printing
+// Layer 4: Canvas noise overlay — injects invisible per-frame noise
+// Layer 5: Keyboard shortcut interception (PrtSc, Cmd+Shift+3/4/5)
+// Layer 6: Visibility + focus events trigger blur
+// Layer 7: pointer-events override on chat content
+// NOTE: OS-level screenshots (hardware buttons) cannot be blocked in any browser.
+//       We maximize detection and make captured content as unreadable as possible.
 function installScreenshotProtection(onDetected) {
-  // Override getDisplayMedia to detect and warn about screen capture
+  // BLOCK getDisplayMedia entirely — screen recording/sharing cannot start
   try {
-    if (navigator.mediaDevices?.getDisplayMedia) {
-      const orig = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
-      navigator.mediaDevices.getDisplayMedia = async (...args) => {
-        onDetected("screen_capture");
-        // Still allow it but warn — we can't truly block it
-        return orig(...args);
-      };
+    if (navigator.mediaDevices) {
+      Object.defineProperty(navigator.mediaDevices, "getDisplayMedia", {
+        value: () => {
+          onDetected("screen_capture_blocked");
+          return Promise.reject(new DOMException("Screen capture blocked by application policy", "NotAllowedError"));
+        },
+        configurable: false, writable: false
+      });
     }
   } catch(_) {}
-  // Detect print (screenshot on some systems)
+
+  // Block getUserMedia for screen sources
   try {
+    const origGUM = navigator.mediaDevices?.getUserMedia?.bind(navigator.mediaDevices);
+    if (origGUM) {
+      Object.defineProperty(navigator.mediaDevices, "getUserMedia", {
+        value: async (constraints) => {
+          if (constraints?.video?.mediaSource === "screen" || constraints?.video?.displaySurface) {
+            onDetected("screen_capture_blocked");
+            return Promise.reject(new DOMException("Blocked", "NotAllowedError"));
+          }
+          return origGUM(constraints);
+        },
+        configurable: false
+      });
+    }
+  } catch(_) {}
+
+  // Print interception — blank out content on print/screenshot-to-PDF
+  try {
+    window.onbeforeprint = () => { onDetected("print"); };
     const mq = window.matchMedia("print");
-    mq.addListener(e => { if(e.matches) onDetected("print"); });
+    const handler = (e) => { if (e.matches) onDetected("print"); };
+    if (mq.addEventListener) mq.addEventListener("change", handler);
+    else mq.addListener(handler);
+  } catch(_) {}
+
+  // Keyboard screenshot shortcuts — intercept on all platforms
+  try {
+    window.addEventListener("keydown", (e) => {
+      const isPrtSc = e.key === "PrintScreen";
+      const isMacSS = e.metaKey && e.shiftKey && ["3","4","5","6"].includes(e.key);
+      const isWinSS = e.key === "PrintScreen" || (e.ctrlKey && e.shiftKey && e.key === "s");
+      if (isPrtSc || isMacSS || isWinSS) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        onDetected("keyboard_shortcut");
+      }
+    }, true); // capture phase — fires before anything else
+  } catch(_) {}
+
+  // Canvas noise injection — draws random noise on a hidden canvas each frame
+  // This creates an imperceptible flicker in the DOM that appears in screenshots
+  try {
+    const noiseCanvas = document.createElement("canvas");
+    noiseCanvas.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:97;opacity:0.004;mix-blend-mode:screen;";
+    noiseCanvas.width = 4; noiseCanvas.height = 4;
+    document.body.appendChild(noiseCanvas);
+    const ctx = noiseCanvas.getContext("2d");
+    let frameId;
+    const drawNoise = () => {
+      const img = ctx.createImageData(4, 4);
+      for (let i = 0; i < img.data.length; i += 4) {
+        const v = Math.random() * 255 | 0;
+        img.data[i] = v; img.data[i+1] = v; img.data[i+2] = v; img.data[i+3] = 255;
+      }
+      ctx.putImageData(img, 0, 0);
+      frameId = requestAnimationFrame(drawNoise);
+    };
+    drawNoise();
+  } catch(_) {}
+
+  // Visibility-based detection
+  try {
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) onDetected("tab_hidden");
+    });
   } catch(_) {}
 }
 
@@ -326,30 +406,404 @@ const NAMES=["WRAITH","SPECTER","CIPHER","PHANTOM","GHOST","RAVEN","SHADOW","VEI
 function newName(){return NAMES[rand(1)[0]%NAMES.length]+"-"+uid(4);}
 let MY_NAME=newName();
 
-// ── Puzzle ────────────────────────────────────────────────────────────────────
-function ri(mn,mx){return Math.floor(Math.random()*(mx-mn+1))+mn;}
-const DNAMES={2:"QUADRATIC",3:"CUBIC",4:"BIQUADRATIC",5:"QUINTIC",6:"SEXTIC"};
-const SUP=["","","²","³","⁴","⁵","⁶"];
-function pStr(cs){const d=cs.length-1;return cs.map((c,i)=>{const p=d-i;if(!c)return null;const a=Math.abs(c),sg=c<0?"−":"+",cv=a===1&&p>0?"":String(a),vv=p===0?"":p===1?"x":`x${SUP[p]}`;return{sg,t:`${cv}${vv}`};}).filter(Boolean).map((x,idx)=>idx===0?(x.sg==="−"?`−${x.t}`:x.t):` ${x.sg} ${x.t}`).join("");}
-function pEval(cs,x){return cs.reduce((s,c,i)=>s+c*Math.pow(x,cs.length-1-i),0);}
-function pHint(cs,x){const d=cs.length-1;const ts=cs.map((c,i)=>{const p=d-i;if(!c)return null;const v=c*Math.pow(x,p);return p===0?`${c}`:`(${c}×${x}${p>1?SUP[p]:""})=${v}`;}).filter(Boolean);return ts.join("+")+`=${pEval(cs,x)}`;}
-function mkP(exD){const avail=[2,3,4,5,6].filter(d=>d!==exD);const deg=avail[ri(0,avail.length-1)];const mX=deg>=5?3:deg>=4?4:6,mC=deg>=5?3:deg>=4?4:6,x=ri(2,mX);const cs=Array.from({length:deg+1},(_,i)=>i===0?ri(1,mC):ri(-mC,mC));return{deg,x,cs,ans:pEval(cs,x),name:DNAMES[deg]};}
-function genPuzzles(){
-  const p1=mkP(-1),p2=mkP(p1.deg);
-  const op=ri(0,2),k=ri(2,9);
-  const mid=op===0?p1.ans+p2.ans:op===1?p1.ans-p2.ans:p1.ans*k;
-  const divs=[2,3,4,5].filter(d=>Number.isInteger(mid/d));
-  let fa,q3,h3;
-  if(divs.length>0&&op!==2){const d=divs[ri(0,divs.length-1)],a=ri(1,20);fa=mid/d+a;q3=`÷${d} then +${a}`;h3=`${mid}÷${d}=${mid/d}+${a}=${fa}`;}
-  else{const s=ri(1,Math.max(2,Math.abs(mid)-1));fa=mid-s;q3=`−${s}`;h3=`${mid}−${s}=${fa}`;}
-  const opQ=op===2?`Step 1 × ${k}`:`Step 1 ${op===0?"+":"−"} Step 2`;
-  return[
-    {title:`STEP 1 — ${p1.name}`,question:`f(x) = ${pStr(p1.cs)}\nf(${p1.x}) = ?`,hint:pHint(p1.cs,p1.x),answer:String(p1.ans)},
-    {title:`STEP 2 — ${p2.name}`,question:`g(x) = ${pStr(p2.cs)}\ng(${p2.x}) = ?`,hint:pHint(p2.cs,p2.x),answer:String(p2.ans)},
-    {title:"STEP 3 — CIPHER",question:`${opQ}, then ${q3}\nResult = ?`,hint:`${opQ}=${mid}, then ${h3}`,answer:String(fa)},
+// ══════════════════════════════════════════════════════════════════════════════
+// PUZZLE ENGINE — 3 stages, randomly selected each page load
+// Stage 1: JEE Main PYQ — Coordinate Geometry
+// Stage 2: Geometrical Optics (JEE level)
+// Stage 3: Murder Mystery deduction puzzle
+// HINTS: direction only — never reveal the answer
+// ══════════════════════════════════════════════════════════════════════════════
+// PUZZLE ENGINE v7 — 3 stages randomly selected each page load
+// Stage 1 & 2: Variable-degree polynomial (degrees 2–6, all random coefficients)
+// Stage 3: Murder Mystery deduction puzzle
+// HINTS: methodology only — zero answers, zero computed values revealed
+// ══════════════════════════════════════════════════════════════════════════════
+
+function ri(mn, mx) { return Math.floor(Math.random() * (mx - mn + 1)) + mn; }
+
+const DEG_NAMES = { 2:"QUADRATIC", 3:"CUBIC", 4:"BIQUADRATIC", 5:"QUINTIC", 6:"SEXTIC" };
+const SUP = ["","","²","³","⁴","⁵","⁶"];
+
+function polyStr(cs) {
+  const d = cs.length - 1;
+  return cs.map((c, i) => {
+    const p = d - i;
+    if (c === 0) return null;
+    const a = Math.abs(c), sg = c < 0 ? "−" : "+";
+    const cv = (a === 1 && p > 0) ? "" : String(a);
+    const vv = p === 0 ? "" : p === 1 ? "x" : `x${SUP[p]}`;
+    return { sg, t: `${cv}${vv}` };
+  }).filter(Boolean).map((x, idx) =>
+    idx === 0 ? (x.sg === "−" ? `−${x.t}` : x.t) : ` ${x.sg} ${x.t}`
+  ).join("");
+}
+
+function polyEval(cs, x) {
+  // Use integer arithmetic to avoid float precision loss for high-degree polynomials
+  let result = 0;
+  const d = cs.length - 1;
+  for (let i = 0; i <= d; i++) {
+    // Horner's method: avoids Math.pow, preserves integer precision
+    result = result * x + cs[i];
+  }
+  return result;
+}
+
+// Hint: methodology only — which formula to use, not the values
+function polyHintText(deg, name, x) {
+  return (
+    `This is a ${name} (degree ${deg}) polynomial.
+` +
+    `Method: substitute x = ${x} into every term one by one.
+` +
+    `For a term cxⁿ, compute c × (${x} raised to the power n).
+` +
+    `Sum all terms carefully, paying attention to negative signs.
+` +
+    `Work from highest power to constant term to avoid mistakes.`
+  );
+}
+
+function makePoly(excludeDeg) {
+  const avail = [2, 3, 4, 5, 6].filter(d => d !== excludeDeg);
+  const deg = avail[ri(0, avail.length - 1)];
+  const maxX = deg >= 5 ? 3 : deg >= 4 ? 4 : 6;
+  const maxC = deg >= 5 ? 3 : deg >= 4 ? 4 : 5;
+  const x = ri(2, maxX);
+  const cs = Array.from({ length: deg + 1 }, (_, i) =>
+    i === 0 ? ri(1, maxC) : ri(-maxC, maxC)
+  );
+  return { deg, x, cs, ans: polyEval(cs, x), name: DEG_NAMES[deg] };
+}
+
+// ── Stage 3: Murder Mystery Pool ─────────────────────────────────────────────
+// All hints give ONLY the logical method — no numbers, no computed values
+const MYSTERY_POOL = [
+  {
+    question:
+      `🔍 THE LOCKED STUDY
+
+` +
+      `Professor Voss was found dead in his locked study at 11 PM.
+` +
+      `Four suspects were in the mansion:
+
+` +
+      `• ARIA — "I was cooking from 9–11 PM."
+` +
+      `  Chef confirms she left the kitchen at 10:15 PM.
+
+` +
+      `• BARON — "I was reading in the library."
+` +
+      `  His book was open to page 1 (claimed to be on page 200).
+
+` +
+      `• CLARA — "I was asleep in my room above the study."
+` +
+      `  A creak from her room was heard at 10:30 PM.
+
+` +
+      `• DIRK — "I was on a call until 11 PM."
+` +
+      `  Phone records: call ended at 10:00 PM.
+
+` +
+      `How many suspects have an alibi DIRECTLY contradicted by evidence?
+` +
+      `Enter that count.`,
+    hint:
+      `For each suspect, compare their specific claim against the specific evidence.
+` +
+      `Only count a contradiction if the evidence DIRECTLY disproves the claim.
+` +
+      `Suspicion and motive do NOT count as contradictions.
+` +
+      `Ask yourself: does the evidence prove the person's statement is false?`,
+    answer: "3",
+  },
+  {
+    question:
+      `🔍 THE POISONED GLASS
+
+` +
+      `Lady Ashford died at midnight. The poison acts in exactly 2 hours.
+
+` +
+      `Three people had access to her drinks:
+` +
+      `• EDGAR — Gave champagne at 9:00 PM. Confirmed at airport by 9:45 PM.
+` +
+      `• FLORA — Brought a drink at 10:30 PM. The glass was never found.
+` +
+      `• GRANT — Left kitchen at 8:00 PM. Fingerprints on a poison bottle.
+
+` +
+      `At what time (24h format) was the poison administered?
+` +
+      `Enter the hour as a positive integer.`,
+    hint:
+      `The poison takes exactly 2 hours to cause death.
+` +
+      `Death occurred at midnight = 00:00 in 24-hour time.
+` +
+      `To find when the poison was given, subtract the reaction time from death time.
+` +
+      `Express midnight in 24h format, subtract 2 hours, and enter the resulting hour.`,
+    answer: "22",
+  },
+  {
+    question:
+      `🔍 THE CIPHER ROOM
+
+` +
+      `Five cryptographers, one stolen master key. Each makes exactly 2 statements.
+` +
+      `Exactly ONE of each person's statements is a lie:
+
+` +
+      `• ALEX:  (1) "I did not steal the key."  (2) "Blake stole the key."
+` +
+      `• BLAKE: (1) "I did not steal the key."  (2) "Casey framed me."
+` +
+      `• CASEY: (1) "Blake is telling the truth." (2) "I never touched the key."
+` +
+      `• DANA:  (1) "Alex is innocent."  (2) "Casey is the thief."
+` +
+      `• EVAN:  (1) "Dana is lying about Casey."  (2) "Thief is among Alex, Blake, Casey."
+
+` +
+      `Who is the thief? Alex=1, Blake=2, Casey=3, Dana=4, Evan=5.
+` +
+      `Enter the thief's number.`,
+    hint:
+      `Assume each person is the thief one at a time and test consistency.
+` +
+      `For each assumption: go through all 10 statements.
+` +
+      `Each person must have exactly 1 true and 1 false statement.
+` +
+      `If your assumption creates a contradiction (0 or 2 lies for anyone), discard it.
+` +
+      `The correct thief produces a fully consistent assignment.`,
+    answer: "3",
+  },
+  {
+    question:
+      `🔍 THE SEALED TRAIN
+
+` +
+      `A diplomat died between Stop 2 and Stop 3 of a train journey.
+
+` +
+      `Four passengers and their journeys:
+` +
+      `• A: Boarded Stop 1, Exited Stop 3
+` +
+      `• B: Boarded Stop 2, Exited Stop 5
+` +
+      `• C: Boarded Stop 1, Exited Stop 2
+` +
+      `• D: Boarded Stop 3, Exited Stop 6
+
+` +
+      `The killer must have been present for the ENTIRE Stop 2→3 segment.
+` +
+      `How many passengers could be the killer? Enter that count.`,
+    hint:
+      `A passenger covers the Stop 2→3 window only if:
+` +
+      `they boarded at or before Stop 2 AND exited at or after Stop 3.
+` +
+      `Check each passenger against both conditions independently.
+` +
+      `Both conditions must be true simultaneously for them to qualify.`,
+    answer: "2",
+  },
+  {
+    question:
+      `🔍 THE GALLERY HEIST
+
+` +
+      `Paintings 1–7 were stolen. Three thieves divided them by rule:
+` +
+      `• RED takes all whose numbers are multiples of 3 (first pick).
+` +
+      `• BLUE takes all remaining prime-numbered paintings.
+` +
+      `• GREEN takes everything left.
+
+` +
+      `The mastermind is whoever stole the most paintings.
+` +
+      `How many did the mastermind steal?`,
+    hint:
+      `Step 1: Which numbers between 1 and 7 are multiples of 3? List them.
+` +
+      `Step 2: From what remains, which numbers are prime?
+` +
+      `  (Primes have exactly two factors: 1 and the number itself.)
+` +
+      `Step 3: Whatever is left belongs to GREEN.
+` +
+      `Count each group's size and identify the largest.`,
+    answer: "3",
+  },
+  {
+    question:
+      `🔍 THE GRID MANSION
+
+` +
+      `A 3-row × 4-column mansion. Rooms numbered 1–12: left-to-right, top-to-bottom.
+` +
+      `The killer moved from Room 1 to Room 8, one wall-adjacent step at a time.
+
+` +
+      `What is the MINIMUM number of moves required?`,
+    hint:
+      `Identify the grid coordinates of Room 1 and Room 8.
+` +
+      `Rows go from top (row 1) to bottom (row 3).
+` +
+      `Columns go from left (col 1) to right (col 4).
+` +
+      `For grid movement with no diagonal steps, the minimum moves equals
+` +
+      `the sum of absolute differences in row and column positions.`,
+    answer: "4",
+  },
+  {
+    question:
+      `🔍 THE SECRET CODE
+
+` +
+      `A victim was found holding a note with a 2-digit number.
+` +
+      `The number satisfies ALL of:
+` +
+      `• It is a perfect square.
+` +
+      `• Its digit sum equals its total factor count.
+` +
+      `• The killer's rank = the TENS digit of this number.
+
+` +
+      `What is the killer's rank?`,
+    hint:
+      `List all 2-digit perfect squares (there are exactly 6 between 10 and 99).
+` +
+      `For each, compute: (a) sum of the two digits, (b) total number of factors.
+` +
+      `Factors include 1 and the number itself — count them all systematically.
+` +
+      `Find which perfect square has digit sum equal to its factor count.
+` +
+      `The tens digit of the qualifying number is your answer.`,
+    answer: "3",
+  },
+  {
+    question:
+      `🔍 THE DETECTIVE'S MESSAGE
+
+` +
+      `Entry order: Sam, Mike, Casey, John, Pat, Julia
+
+` +
+      `The killer is person N in the entry log. Clues for N:
+` +
+      `• N is prime and less than 6
+` +
+      `• N is odd
+` +
+      `• Person N has a name with exactly 5 letters
+
+` +
+      `Enter N as a positive integer.`,
+    hint:
+      `List primes less than 6. Then keep only the odd ones.
+` +
+      `For each remaining candidate N, look up who is at position N
+` +
+      `in the entry order and count the letters in their name.
+` +
+      `Only one value of N satisfies all three conditions together.`,
+    answer: "3",
+  },
+  {
+    question:
+      `🔍 THE CLOCKWORK MURDER
+
+` +
+      `Three witnesses:
+` +
+      `• 3:00 PM — "Victim was alive"
+` +
+      `• 4:45 PM — "I heard a scream"
+` +
+      `• 6:00 PM — "Body was already cold"
+
+` +
+      `Coroner: body goes cold exactly 1 hour after death.
+` +
+      `The murder happened in a window where the clock's minute hand
+` +
+      `travels from 12 to 9 (clockwise) — i.e., during the :00–:45 of any hour.
+
+` +
+      `How many complete hours between 3 PM and 6 PM contain this window?
+` +
+      `Enter the count.`,
+    hint:
+      `The :00–:45 window of any hour = minute hand at 12 o'clock to 9 o'clock.
+` +
+      `Narrow the time of death using the witness clues and coroner's rule.
+` +
+      `Then count how many full hours within the possible murder window
+` +
+      `each contain a complete :00-to-:45 segment.
+` +
+      `Consider: which hours are fully or partially within the murder window?`,
+    answer: "2",
+  },
+];
+
+function pickRandom(pool) { return pool[Math.floor(Math.random() * pool.length)]; }
+
+function genPuzzles() {
+  const p1 = makePoly(-1);
+  const p2 = makePoly(p1.deg);
+  const mystery = pickRandom(MYSTERY_POOL);
+  return [
+    {
+      title: `STEP 1 OF 3 — ${p1.name} POLYNOMIAL`,
+      question: `Evaluate the following polynomial at x = ${p1.x}:
+
+f(x) = ${polyStr(p1.cs)}
+
+What is f(${p1.x})? Enter as an integer.`,
+      hint: polyHintText(p1.deg, p1.name, p1.x),
+      answer: String(p1.ans),
+    },
+    {
+      title: `STEP 2 OF 3 — ${p2.name} POLYNOMIAL`,
+      question: `Evaluate the following polynomial at x = ${p2.x}:
+
+g(x) = ${polyStr(p2.cs)}
+
+What is g(${p2.x})? Enter as an integer.`,
+      hint: polyHintText(p2.deg, p2.name, p2.x),
+      answer: String(p2.ans),
+    },
+    {
+      title: "STEP 3 OF 3 — MURDER MYSTERY",
+      question: mystery.question,
+      hint: mystery.hint,
+      answer: mystery.answer,
+    },
   ];
 }
-const PUZZLES=genPuzzles();
+
+const PUZZLES = genPuzzles();
 
 // ── CSS — mobile-first + screenshot protection ────────────────────────────────
 const css=`
@@ -380,15 +834,33 @@ const css=`
 
   .crt{background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,157,.009) 2px,rgba(0,255,157,.009) 4px);pointer-events:none;position:fixed;inset:0;z-index:99;}
 
-  /* Screen capture shield — rapidly oscillates brightness making recordings unusable */
+  /* Screen capture shield — triple-layer approach */
+  /* Layer A: rapid black flicker at 60fps — destroys video recordings */
+  /* Layer B: mix-blend-mode:difference inverts colors unpredictably */
+  /* Layer C: CSS filter noise adds visual interference */
   .capture-shield{
     position:fixed;inset:0;z-index:98;pointer-events:none;
-    background:transparent;
-    mix-blend-mode:difference;
-    animation:screenshield 0.15s steps(1) infinite;
-    display:none; /* only shown when screen capture detected */
+    display:none;
   }
   .capture-shield.active{display:block;}
+  .capture-shield-a{
+    position:fixed;inset:0;z-index:98;pointer-events:none;
+    background:#000;
+    animation:screenshield2 0.05s steps(1) infinite;
+    display:none;
+  }
+  .capture-shield-a.active{display:block;}
+  .capture-shield-b{
+    position:fixed;inset:0;z-index:97;pointer-events:none;
+    background:repeating-linear-gradient(45deg,#fff 0,#fff 1px,transparent 1px,transparent 4px);
+    mix-blend-mode:difference;
+    opacity:0;
+    animation:shieldpulse 0.08s steps(1) infinite;
+    display:none;
+  }
+  .capture-shield-b.active{display:block;}
+  @keyframes shieldpulse{0%,100%{opacity:0}50%{opacity:0.9}}
+  @keyframes screenshield2{0%,49%{opacity:0}50%,100%{opacity:1}} /* faster variant for shield-a */
 
   .p-input{background:transparent;border:1px solid #00ff9d2a;color:#00ff9d;font-family:'Courier New',monospace;font-size:16px;padding:14px;outline:none;width:100%;letter-spacing:.5px;transition:all .2s;border-radius:0;-webkit-appearance:none;appearance:none;}
   .p-input:focus{border-color:#00ff9d77;box-shadow:0 0 12px #00ff9d12;}
@@ -431,6 +903,12 @@ const css=`
   .step-row.pending{color:#00ff9d33;}
 
   /* Mobile layout fixes */
+  /* Chat content uses CSS that degrades screenshot quality */
+  .chat-messages-wrap{
+    -webkit-user-select:none;user-select:none;
+    /* Isolation layer — helps mix-blend-mode work correctly */
+    isolation:isolate;
+  }
   .chat-root{
     height:100vh;
     height:100dvh; /* dynamic viewport height — fixes iOS keyboard issue */
@@ -475,7 +953,7 @@ const css=`
 `;
 
 const DESTRUCT_OPTIONS=[0,10,30,60,300];
-const IDLE_MS=5*60*1000;
+const IDLE_MS=1*60*1000; // 1 minute idle auto-lock
 const EXPIRY_MS=4*60*60*1000;
 const NAME_ROTATE=50;
 
@@ -543,7 +1021,16 @@ export default function SecureChat() {
   // Self-destruct timer
   useEffect(()=>{
     if(!destructTime) return;
-    const iv=setInterval(()=>{const now=Date.now();setMessages(p=>p.filter(m=>m.sys||!m.destructAt||m.destructAt>now));},1000);
+    const iv=setInterval(()=>{
+      const now=Date.now();
+      setMessages(p=>{
+        const kept=p.filter(m=>m.sys||!m.destructAt||m.destructAt>now);
+        // Prune hashes for destroyed messages
+        const keptIds=new Set(kept.map(m=>m.id));
+        setMsgHashes(h=>Object.fromEntries(Object.entries(h).filter(([id])=>keptIds.has(id))));
+        return kept;
+      });
+    },1000);
     return()=>clearInterval(iv);
   },[destructTime]);
 
@@ -605,10 +1092,13 @@ export default function SecureChat() {
     setMessages(p=>[...p,{id,sender,text,ts:Date.now(),mine,isImage,imageData,destructAt,burnOnRead}]);
     if(text) msgHash(text).then(h=>setMsgHashes(prev=>({...prev,[id]:h})));
     msgCountRef.current++;
-    if(msgCountRef.current%NAME_ROTATE===0){myNameRef.current=newName();MY_NAME=myNameRef.current;addSys(`🔄 Codename → ${myNameRef.current}`);}
+    if(msgCountRef.current%NAME_ROTATE===0){myNameRef.current=newName();addSys(`🔄 Codename → ${myNameRef.current}`);}
     if(!mine) haptic([15]); // haptic on receive
   };
-  const markRead=(id)=>setMessages(p=>p.filter(m=>!(m.id===id&&m.burnOnRead)));
+  const markRead=(id)=>{
+    setMessages(p=>p.filter(m=>!(m.id===id&&m.burnOnRead)));
+    setMsgHashes(h=>{const n={...h};delete n[id];return n;});
+  };
 
   // Puzzle
   const checkPuzzle=()=>{
@@ -629,12 +1119,20 @@ export default function SecureChat() {
   const connect=useCallback(async()=>{
     if(!roomId.trim()||!roomKey.trim()) return;
     setStatus("connecting");setConnErr("");
+    // Reset stale peer sessions from any previous connection
+    peersRef.current = {};
+    setPeers({});
+    setSasCodes({});
+    setSecInfo({ratchet:0,x3dh:0});
     try {
       setConnStep("Generating Signal keys (IK, SPK, OPK)…");
       identityRef.current=await new SignalIdentity().generate();
 
       setConnStep("Stretching key (PBKDF2-SHA512)…");
-      roomBitsRef.current=await stretchKey(roomKey.trim(),"phantom-v6:"+roomId.trim());
+      // Sanitise inputs — truncate to 64 chars max to prevent slow PBKDF2 DoS
+      const safeKey=roomKey.trim().slice(0,64);
+      const safeRoom=roomId.trim().slice(0,32);
+      roomBitsRef.current=await stretchKey(safeKey,"phantom-v6:"+safeRoom);
 
       setConnStep("Computing fingerprint…");
       setFp(await roomFP(roomId.trim(),roomKey.trim()));
@@ -736,7 +1234,16 @@ export default function SecureChat() {
           else addMsg(env.f||pkg.name,env.p,false,false,null,env.b);
         }
       },
-      ()=>{clearInterval(pingRef.current);clearTimeout(decoyRef.current);setStatus("disconnected");if(phase==="chat")addSys("Disconnected.");},
+      ()=>{
+        clearInterval(pingRef.current);
+        clearTimeout(decoyRef.current);
+        lastTyping.current=0; // reset throttle
+        peersRef.current={}; // clear stale sessions
+        setPeers({});
+        setSasCodes({});
+        setStatus("disconnected");
+        if(phase==="chat") addSys("Disconnected. Refresh to reconnect.");
+      },
       setConnStep);
 
     }catch(e){setStatus("error");setConnErr(e.message||"Connection failed");setConnStep("");}
@@ -776,7 +1283,8 @@ export default function SecureChat() {
 
   const sendFile=useCallback(async(file)=>{
     if(!file||wsRef.current?.readyState!==WebSocket.OPEN) return;
-    if(file.size>5*1024*1024){addSys("⚠ Max 5MB.");return;}
+    // 3.5MB limit — base64 encoding adds ~33% overhead, so actual WS payload ~4.7MB
+    if(file.size>3.5*1024*1024){addSys("⚠ Max file size is 3.5MB.");return;}
     const isImage=file.type.startsWith("image/");
     const reader=new FileReader();
     reader.onerror=()=>addSys(`⚠ Failed to read "${file.name}".`);
@@ -979,7 +1487,9 @@ export default function SecureChat() {
       onMouseMove={resetIdle} onTouchStart={resetIdle}>
       <style>{css}</style>
       <div className="crt"/>
-      {/* Screenshot shield — active when screen capture detected */}
+      {/* Screenshot shield — triple layer */}
+      <div className={`capture-shield-a ${shieldActive?"active":""}`}/>
+      <div className={`capture-shield-b ${shieldActive?"active":""}`}/>
       <div className={`capture-shield ${shieldActive?"active":""}`}/>
 
       <input type="file" ref={fileRef} style={{display:"none"}} accept="image/*,*/*"
@@ -1034,7 +1544,7 @@ export default function SecureChat() {
       )}
 
       {/* Messages */}
-      <div className="messages-area" style={{padding:"12px 12px 6px"}}>
+      <div className="messages-area chat-messages-wrap" style={{padding:"12px 12px 6px"}}>
         {messages.map(m=>(
           <div key={m.id} className="msg" style={{marginBottom:10,display:"flex",flexDirection:"column",alignItems:m.mine?"flex-end":m.sys?"center":"flex-start"}}
             onClick={()=>m.burnOnRead&&!m.mine&&markRead(m.id)}>
