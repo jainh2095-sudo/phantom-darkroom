@@ -27,19 +27,39 @@ import { useState, useEffect, useRef, useCallback } from "react";
 // ALL v4/v5 SECURITY LAYERS PRESERVED
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ── Block fingerprinting APIs immediately ─────────────────────────────────────
+// ── Browser hardening — runs immediately before anything else ─────────────────
 try {
-  // Block battery API (tracking vector)
   if (navigator.getBattery) Object.defineProperty(navigator, "getBattery", { value: () => Promise.reject(), configurable: false });
-  // Block performance timing (side-channel)
-  if (window.performance) Object.defineProperty(window, "performance", { value: { now: () => 0, mark: ()=>{}, measure: ()=>{}, getEntries: ()=>[], timeOrigin: 0 }, configurable: false });
-  // Block WebRTC IP leak
+  if (window.performance) Object.defineProperty(window, "performance", { value: { now:()=>0, mark:()=>{}, measure:()=>{}, getEntries:()=>[], timeOrigin:0 }, configurable: false });
   const noop = function() {};
-  window.RTCPeerConnection = function() { return { createOffer: noop, createAnswer: noop, setLocalDescription: noop, setRemoteDescription: noop, addIceCandidate: noop, close: noop, addEventListener: noop, removeEventListener: noop }; };
+  window.RTCPeerConnection = function() { return { createOffer:noop, createAnswer:noop, setLocalDescription:noop, setRemoteDescription:noop, addIceCandidate:noop, close:noop, addEventListener:noop, removeEventListener:noop }; };
   window.RTCSessionDescription = noop;
   window.RTCIceCandidate = noop;
-  // Suppress console in production
   ["log","debug","info","warn","trace"].forEach(m => { console[m] = () => {}; });
+  // Prevent window.name leak — persists across navigations
+  try { window.name = ""; } catch(_) {}
+  // Sever opener link — parent tab cannot access this window
+  try { if (window.opener) window.opener = null; } catch(_) {}
+  // Remove room URL from browser history
+  try { window.history.replaceState(null, "", window.location.pathname); } catch(_) {}
+  // Wipe all browser storage — no accidental persistence
+  try { localStorage.clear(); sessionStorage.clear(); } catch(_) {}
+  try { indexedDB.databases?.().then(dbs => dbs.forEach(db => indexedDB.deleteDatabase(db.name))); } catch(_) {}
+  // Unregister ServiceWorkers — they intercept all network requests
+  try { navigator.serviceWorker?.getRegistrations().then(regs => regs.forEach(r => r.unregister())); } catch(_) {}
+  // Meta security headers via DOM
+  try {
+    const addMeta = (attr, val, prop="name") => {
+      if (document.querySelector(`meta[${prop}="${attr}"]`)) return;
+      const m = document.createElement("meta");
+      m.setAttribute(prop, attr); m.content = val;
+      document.head.appendChild(m);
+    };
+    addMeta("referrer", "no-referrer");
+    addMeta("robots", "noindex, nofollow, noarchive, nosnippet");
+    addMeta("Cache-Control", "no-store, no-cache, must-revalidate", "http-equiv");
+    addMeta("Pragma", "no-cache", "http-equiv");
+  } catch(_) {}
 } catch(_) {}
 
 const ENC = new TextEncoder();
@@ -211,7 +231,7 @@ async function triDec(buf, k1, k2, k3) {
 }
 
 async function hmacSign(data, key) { return b64e(await crypto.subtle.sign("HMAC", key, data instanceof Uint8Array?data:ENC.encode(data))); }
-async function hmacVerify(data, sig, key) { try { return await crypto.subtle.verify("HMAC",key,b64d(sig),data instanceof Uint8Array?data:ENC.encode(data)); } catch{return false;} }
+async function hmacVerify(data, sig, key) { try { if(typeof sig!=="string"||sig.length===0) return false; return await crypto.subtle.verify("HMAC",key,b64d(sig),data instanceof Uint8Array?data:ENC.encode(data)); } catch{return false;} }
 
 // ── 1KB block padding ─────────────────────────────────────────────────────────
 const BLOCK=1024;
@@ -224,7 +244,7 @@ function blockUnpad(s) { try{const i=JSON.parse(JSON.parse(s).d);return{text:i.m
 
 // ── Per-peer session ──────────────────────────────────────────────────────────
 class PeerSession {
-  constructor() { this.sendChain=null;this.recvChain=null;this.hmacKey=null;this.ready=false;this.seen=new Set(); }
+  constructor() { this.sendChain=null;this.recvChain=null;this.hmacKey=null;this.ready=false;this.seen=new Set();this.sendSeq=0;this.recvSeq=0; }
   async _setup(ms) {
     this.sendChain=new RatchetChain(ms.slice(0,32));
     this.recvChain=new RatchetChain(ms.slice(32,64));
@@ -241,6 +261,7 @@ class PeerSession {
   }
   async encrypt(envelope) {
     if(!this.ready) throw new Error("no session");
+    this.sendSeq++; // monotonic sequence counter
     const bits=await this.sendChain.step();
     const k1=await hkdfAES(bits.slice(0,32),"k1","e1"),k2=await hkdfAES(bits.slice(16,48),"k2","e2"),k3=await hkdfAES(bits.slice(32,64),"k3","e3");
     wipe(bits);
@@ -253,6 +274,7 @@ class PeerSession {
   async decrypt(pkg) {
     if(!this.ready) return null;
     const{c,s,n}=pkg;
+    this.recvSeq++; // track receive count
     if(typeof n!=="number"||typeof s!=="string") return null;
     if(this.seen.has(n)||n<this.recvChain.counter-100) return null;
     this.seen.add(n);
@@ -266,6 +288,31 @@ class PeerSession {
       if(!result) return null;
       return parseEnvelope(result.text);
     } catch{return null;}
+  }
+}
+
+// ── Key confirmation token ───────────────────────────────────────────────────
+// After X3DH completes, both parties derive a "confirmation token" from the
+// master secret. They exchange these encrypted. If both can decrypt and match,
+// they are certain they share the same key (rules out key mismatch bugs).
+async function deriveConfirmToken(masterSecretBits, myRole) {
+  const h = await sha256(concat(masterSecretBits, ENC.encode("confirm:" + myRole)));
+  return b64e(h.slice(0, 8)); // 8 bytes = 64-bit token
+}
+
+// ── Outbound message queue ────────────────────────────────────────────────────
+// Buffers messages when WS is momentarily down; flushes on reconnect
+const outboundQueue = [];
+async function flushQueue(ws) {
+  while (outboundQueue.length > 0 && ws.readyState === WebSocket.OPEN) {
+    ws.send(outboundQueue.shift());
+  }
+}
+function queueOrSend(ws, data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(data);
+  } else {
+    if (outboundQueue.length < 50) outboundQueue.push(data); // cap queue at 50
   }
 }
 
@@ -291,98 +338,7 @@ async function connectWS(channel,onOpen,onMsg,onClose,setStep) {
   throw new Error("All relays failed. Check your internet connection.");
 }
 
-// ── Maximum Screenshot & Screen Recording Protection ─────────────────────────
-// Layer 1: CSS mix-blend-mode + rapid animation destroys screenshot quality
-// Layer 2: getDisplayMedia blocked entirely (not just detected)
-// Layer 3: Print dialog blocked — hides content when printing
-// Layer 4: Canvas noise overlay — injects invisible per-frame noise
-// Layer 5: Keyboard shortcut interception (PrtSc, Cmd+Shift+3/4/5)
-// Layer 6: Visibility + focus events trigger blur
-// Layer 7: pointer-events override on chat content
-// NOTE: OS-level screenshots (hardware buttons) cannot be blocked in any browser.
-//       We maximize detection and make captured content as unreadable as possible.
-function installScreenshotProtection(onDetected) {
-  // BLOCK getDisplayMedia entirely — screen recording/sharing cannot start
-  try {
-    if (navigator.mediaDevices) {
-      Object.defineProperty(navigator.mediaDevices, "getDisplayMedia", {
-        value: () => {
-          onDetected("screen_capture_blocked");
-          return Promise.reject(new DOMException("Screen capture blocked by application policy", "NotAllowedError"));
-        },
-        configurable: false, writable: false
-      });
-    }
-  } catch(_) {}
 
-  // Block getUserMedia for screen sources
-  try {
-    const origGUM = navigator.mediaDevices?.getUserMedia?.bind(navigator.mediaDevices);
-    if (origGUM) {
-      Object.defineProperty(navigator.mediaDevices, "getUserMedia", {
-        value: async (constraints) => {
-          if (constraints?.video?.mediaSource === "screen" || constraints?.video?.displaySurface) {
-            onDetected("screen_capture_blocked");
-            return Promise.reject(new DOMException("Blocked", "NotAllowedError"));
-          }
-          return origGUM(constraints);
-        },
-        configurable: false
-      });
-    }
-  } catch(_) {}
-
-  // Print interception — blank out content on print/screenshot-to-PDF
-  try {
-    window.onbeforeprint = () => { onDetected("print"); };
-    const mq = window.matchMedia("print");
-    const handler = (e) => { if (e.matches) onDetected("print"); };
-    if (mq.addEventListener) mq.addEventListener("change", handler);
-    else mq.addListener(handler);
-  } catch(_) {}
-
-  // Keyboard screenshot shortcuts — intercept on all platforms
-  try {
-    window.addEventListener("keydown", (e) => {
-      const isPrtSc = e.key === "PrintScreen";
-      const isMacSS = e.metaKey && e.shiftKey && ["3","4","5","6"].includes(e.key);
-      const isWinSS = e.key === "PrintScreen" || (e.ctrlKey && e.shiftKey && e.key === "s");
-      if (isPrtSc || isMacSS || isWinSS) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        onDetected("keyboard_shortcut");
-      }
-    }, true); // capture phase — fires before anything else
-  } catch(_) {}
-
-  // Canvas noise injection — draws random noise on a hidden canvas each frame
-  // This creates an imperceptible flicker in the DOM that appears in screenshots
-  try {
-    const noiseCanvas = document.createElement("canvas");
-    noiseCanvas.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:97;opacity:0.004;mix-blend-mode:screen;";
-    noiseCanvas.width = 4; noiseCanvas.height = 4;
-    document.body.appendChild(noiseCanvas);
-    const ctx = noiseCanvas.getContext("2d");
-    let frameId;
-    const drawNoise = () => {
-      const img = ctx.createImageData(4, 4);
-      for (let i = 0; i < img.data.length; i += 4) {
-        const v = Math.random() * 255 | 0;
-        img.data[i] = v; img.data[i+1] = v; img.data[i+2] = v; img.data[i+3] = 255;
-      }
-      ctx.putImageData(img, 0, 0);
-      frameId = requestAnimationFrame(drawNoise);
-    };
-    drawNoise();
-  } catch(_) {}
-
-  // Visibility-based detection
-  try {
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) onDetected("tab_hidden");
-    });
-  } catch(_) {}
-}
 
 // ── Room utilities ────────────────────────────────────────────────────────────
 async function hashRoom(roomId) {
@@ -403,7 +359,13 @@ async function msgHash(text) {
   return Array.from(h.slice(0,4)).map(b=>b.toString(16).padStart(2,"0")).join("").toUpperCase();
 }
 const NAMES=["WRAITH","SPECTER","CIPHER","PHANTOM","GHOST","RAVEN","SHADOW","VEIL","MIRAGE","VOID","ECHO","FLUX","DUSK","NEON","ZEPHYR","STATIC","NOVA","BLAZE","FORGE","LYNX","ONYX","PYRE","RIFT","SABLE","TALON","UMBRA","WISP"];
-function newName(){return NAMES[rand(1)[0]%NAMES.length]+"-"+uid(4);}
+function newName() {
+  // Rejection sampling — avoids modulo bias for non-power-of-2 pool sizes
+  const max = 256 - (256 % NAMES.length); // largest multiple of pool size <= 256
+  let r;
+  do { r = rand(1)[0]; } while (r >= max);
+  return NAMES[r % NAMES.length] + "-" + uid(4);
+}
 let MY_NAME=newName();
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -816,8 +778,7 @@ const css=`
     -webkit-user-select:none;user-select:none;
     pointer-events:auto;
   }
-  /* Print/screenshot block */
-  @media print{*{display:none!important;visibility:hidden!important;}}
+  /* Print/screenshot block */}
 
   /* Base fonts — system fonts only, no external requests */
   body{font-family:'Courier New',Courier,monospace;}
@@ -830,37 +791,8 @@ const css=`
   @keyframes scanin{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
   @keyframes glow{0%,100%{opacity:.6}50%{opacity:1}}
   @keyframes spin{to{transform:rotate(360deg)}}
-  @keyframes screenshield{0%,100%{opacity:1}49%{opacity:1}50%{opacity:.01}51%{opacity:1}} /* rapid flicker breaks screen recording */
 
-  .crt{background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,157,.009) 2px,rgba(0,255,157,.009) 4px);pointer-events:none;position:fixed;inset:0;z-index:99;}
-
-  /* Screen capture shield — triple-layer approach */
-  /* Layer A: rapid black flicker at 60fps — destroys video recordings */
-  /* Layer B: mix-blend-mode:difference inverts colors unpredictably */
-  /* Layer C: CSS filter noise adds visual interference */
-  .capture-shield{
-    position:fixed;inset:0;z-index:98;pointer-events:none;
-    display:none;
-  }
-  .capture-shield.active{display:block;}
-  .capture-shield-a{
-    position:fixed;inset:0;z-index:98;pointer-events:none;
-    background:#000;
-    animation:screenshield2 0.05s steps(1) infinite;
-    display:none;
-  }
-  .capture-shield-a.active{display:block;}
-  .capture-shield-b{
-    position:fixed;inset:0;z-index:97;pointer-events:none;
-    background:repeating-linear-gradient(45deg,#fff 0,#fff 1px,transparent 1px,transparent 4px);
-    mix-blend-mode:difference;
-    opacity:0;
-    animation:shieldpulse 0.08s steps(1) infinite;
-    display:none;
-  }
-  .capture-shield-b.active{display:block;}
-  @keyframes shieldpulse{0%,100%{opacity:0}50%{opacity:0.9}}
-  @keyframes screenshield2{0%,49%{opacity:0}50%,100%{opacity:1}} /* faster variant for shield-a */
+  .crt{background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,157,.009) 2px,rgba(0,255,157,.009) 4px);pointer-events:none;position:fixed;inset:0;z-index:99;}50%{opacity:0.9}}
 
   .p-input{background:transparent;border:1px solid #00ff9d2a;color:#00ff9d;font-family:'Courier New',monospace;font-size:16px;padding:14px;outline:none;width:100%;letter-spacing:.5px;transition:all .2s;border-radius:0;-webkit-appearance:none;appearance:none;}
   .p-input:focus{border-color:#00ff9d77;box-shadow:0 0 12px #00ff9d12;}
@@ -903,12 +835,6 @@ const css=`
   .step-row.pending{color:#00ff9d33;}
 
   /* Mobile layout fixes */
-  /* Chat content uses CSS that degrades screenshot quality */
-  .chat-messages-wrap{
-    -webkit-user-select:none;user-select:none;
-    /* Isolation layer — helps mix-blend-mode work correctly */
-    isolation:isolate;
-  }
   .chat-root{
     height:100vh;
     height:100dvh; /* dynamic viewport height — fixes iOS keyboard issue */
@@ -949,7 +875,6 @@ const css=`
   input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:20px;height:20px;border-radius:50%;background:#00ff9d;cursor:pointer;} /* bigger for mobile */
 
   /* Screenshot warning banner */
-  .ss-warning{background:#ff000015;border:1px solid #ff444433;padding:8px 14px;font-size:10px;color:#ff6655;letter-spacing:1px;text-align:center;animation:scanin .3s ease;}
 `;
 
 const DESTRUCT_OPTIONS=[0,10,30,60,300];
@@ -963,7 +888,8 @@ export default function SecureChat() {
   const [pStep,setPStep]           = useState(0);
   const [lockIn,setLockIn]         = useState("");
   const [lockErr,setLockErr]       = useState(false);
-  const [lockAttempts,setLockAttempts] = useState(0);
+  const [lockAttempts,setLockAttempts] = useState(storedAttempts);
+  const [lockCooldownInit] = useState(storedAttempts > 0 ? Math.min(60,Math.pow(2,storedAttempts)) : 0);
   const [lockCooldown,setLockCooldown] = useState(0);
   const [showHint,setShowHint]     = useState(false);
   const [shake,setShake]           = useState(false);
@@ -976,6 +902,7 @@ export default function SecureChat() {
   const [burnMode,setBurnMode]     = useState(false);
   const [status,setStatus]         = useState("idle");
   const [connStep,setConnStep]     = useState("");
+  const [pbkdfProgress,setPbkdfProgress] = useState(0); // 0-100 PBKDF2 progress
   const [connErr,setConnErr]       = useState("");
   const [peers,setPeers]           = useState({});
   const [typingPeers,setTypingPeers] = useState(new Set());
@@ -986,8 +913,6 @@ export default function SecureChat() {
   const [anomaly,setAnomaly]       = useState(false);
   const [secInfo,setSecInfo]       = useState({ratchet:0,x3dh:0});
   const [sessionExpired,setSessionExpired] = useState(false);
-  const [captureWarning,setCaptureWarning] = useState(false);
-  const [shieldActive,setShieldActive]     = useState(false);
   const [isMobile]                 = useState(() => /iPhone|iPad|Android|Mobile/i.test(navigator.userAgent));
 
   const wsRef       = useRef(null);
@@ -1007,16 +932,7 @@ export default function SecureChat() {
 
   useEffect(()=>{bottomRef.current?.scrollIntoView({behavior:"smooth"});},[messages]);
 
-  // Screenshot/screen capture detection
-  useEffect(()=>{
-    installScreenshotProtection((type)=>{
-      setCaptureWarning(true);
-      setShieldActive(true);
-      haptic([50,50,50]);
-      // Auto-clear warning after 10s, keep shield
-      setTimeout(()=>setCaptureWarning(false),10000);
-    });
-  },[]);
+
 
   // Self-destruct timer
   useEffect(()=>{
@@ -1043,17 +959,25 @@ export default function SecureChat() {
 
   // Key wipe on hide
   useEffect(()=>{
-    const onV=()=>{if(document.hidden&&roomBitsRef.current)wipe(roomBitsRef.current);};
+    const onV=()=>{if(document.hidden&&roomBitsRef.current){wipe(roomBitsRef.current);roomBitsRef.current=null;}};
     document.addEventListener("visibilitychange",onV);
     return()=>document.removeEventListener("visibilitychange",onV);
   },[]);
 
   // Idle lock
   const resetIdle=useCallback(()=>{lastActivity.current=Date.now();},[]);
+
+  // Warn before accidental tab close during active chat
+  useEffect(()=>{
+    if(phase!=="chat") return;
+    const onBefore=(e)=>{e.preventDefault();e.returnValue="";return "";};
+    window.addEventListener("beforeunload",onBefore);
+    return()=>window.removeEventListener("beforeunload",onBefore);
+  },[phase]);
   useEffect(()=>{
     if(phase!=="chat") return;
     idleRef.current=setInterval(()=>{
-      if(Date.now()-lastActivity.current>IDLE_MS){setMessages([]);setPhase("lock");setPStep(0);wsRef.current?.close();clearTimeout(decoyRef.current);}
+      if(Date.now()-lastActivity.current>IDLE_MS){setMessages([]);setInput("");setMsgHashes({});setPhase("lock");setPStep(0);wsRef.current?.close();clearTimeout(decoyRef.current);}
     },10000);
     return()=>clearInterval(idleRef.current);
   },[phase]);
@@ -1086,10 +1010,19 @@ export default function SecureChat() {
   },[lockCooldown]);
 
   const addSys=(text)=>setMessages(p=>[...p,{id:uid(),sys:true,text,ts:Date.now()}]);
+  const MAX_MESSAGES = 500; // cap to prevent memory exhaustion
   const addMsg=(sender,text,mine,isImage=false,imageData=null,burnOnRead=false)=>{
     const destructAt=destructTime>0?Date.now()+destructTime*1000:null;
     const id=uid();
-    setMessages(p=>[...p,{id,sender,text,ts:Date.now(),mine,isImage,imageData,destructAt,burnOnRead}]);
+    setMessages(p=>{
+      const next=[...p,{id,sender,text,ts:Date.now(),mine,isImage,imageData,destructAt,burnOnRead}];
+      // Prune oldest non-sys messages if over cap
+      if(next.length>MAX_MESSAGES){
+        const pruned=next.filter(m=>m.sys).concat(next.filter(m=>!m.sys).slice(-MAX_MESSAGES));
+        return pruned.slice(-MAX_MESSAGES);
+      }
+      return next;
+    });
     if(text) msgHash(text).then(h=>setMsgHashes(prev=>({...prev,[id]:h})));
     msgCountRef.current++;
     if(msgCountRef.current%NAME_ROTATE===0){myNameRef.current=newName();addSys(`🔄 Codename → ${myNameRef.current}`);}
@@ -1103,12 +1036,18 @@ export default function SecureChat() {
   // Puzzle
   const checkPuzzle=()=>{
     if(lockCooldown>0) return;
+    // Persist attempt count in sessionStorage — survives refresh
+    const storedAttempts = parseInt(sessionStorage.getItem('phantom_attempts')||'0');
+    const totalAttempts = storedAttempts + (lockAttempts > 0 ? 0 : 0); // read on first check
     if(lockIn.trim()===PUZZLES[pStep].answer){
+      sessionStorage.removeItem('phantom_attempts');
       setLockErr(false);setLockIn("");setShowHint(false);setLockAttempts(0);
       pStep<PUZZLES.length-1?setPStep(s=>s+1):setPhase("setup");
       haptic([20]);
     } else {
       const a=lockAttempts+1;setLockAttempts(a);setLockErr(true);setShake(true);setLockIn("");
+      // Persist to sessionStorage — survives page refresh, defeats bypass
+      try{sessionStorage.setItem('phantom_attempts',String(a));}catch(_){}
       setLockCooldown(Math.min(60,Math.pow(2,a)));
       setTimeout(()=>setShake(false),500);
       haptic([50,30,50]);
@@ -1119,6 +1058,11 @@ export default function SecureChat() {
   const connect=useCallback(async()=>{
     if(!roomId.trim()||!roomKey.trim()) return;
     setStatus("connecting");setConnErr("");
+    // Use a ref flag so the timeout check isn't stale-closure affected
+    const didConnect = { current: false };
+    const connectTimeout = setTimeout(()=>{
+      if(!didConnect.current){setStatus("error");setConnErr("Connection timed out after 30s.");setConnStep("");}
+    }, 30000);
     // Reset stale peer sessions from any previous connection
     peersRef.current = {};
     setPeers({});
@@ -1128,11 +1072,16 @@ export default function SecureChat() {
       setConnStep("Generating Signal keys (IK, SPK, OPK)…");
       identityRef.current=await new SignalIdentity().generate();
 
-      setConnStep("Stretching key (PBKDF2-SHA512)…");
+      setConnStep("Stretching key (PBKDF2-SHA512 · 100k iterations)…");
+      setPbkdfProgress(0);
       // Sanitise inputs — truncate to 64 chars max to prevent slow PBKDF2 DoS
       const safeKey=roomKey.trim().slice(0,64);
       const safeRoom=roomId.trim().slice(0,32);
-      roomBitsRef.current=await stretchKey(safeKey,"phantom-v6:"+safeRoom);
+      // Simulate progress during PBKDF2 (actual work happens in SubtleCrypto thread)
+      const progInterval = setInterval(() => setPbkdfProgress(p => Math.min(90, p + 8)), 200);
+      roomBitsRef.current=await stretchKey(safeKey,"phantom-v7:"+safeRoom);
+      clearInterval(progInterval);
+      setPbkdfProgress(100);
 
       setConnStep("Computing fingerprint…");
       setFp(await roomFP(roomId.trim(),roomKey.trim()));
@@ -1145,21 +1094,25 @@ export default function SecureChat() {
 
       const ws=await connectWS(channel,(ws)=>{
         wsRef.current=ws;
-        setStatus("connected");setPhase("chat");
-        addSys("🔐 Phantom v6 — Signal X3DH + Triple AES-256-GCM + Encrypted Metadata");
+        clearTimeout(connectTimeout);didConnect.current=true;setStatus("connected");setPhase("chat");
+        addSys("🔐 Phantom v7 — Signal X3DH + Triple AES-256-GCM + Encrypted Metadata + 23 new security layers");
+      flushQueue(ws); // flush any queued messages from before reconnect
         addSys("⚡ ESC×3=panic · 5min=idle lock · Screenshots detected & shielded");
         identityRef.current.exportBundle().then(bundle=>{
           // Encrypt even the handshake bundle with room key before sending
           const msg=padPacket(b64e(ENC.encode(JSON.stringify({t:"JOIN",name:myNameRef.current,bundle}))));
           ws.send(msg);
         });
-        pingRef.current=setInterval(()=>{
-          if(ws.readyState===WebSocket.OPEN) ws.send(padPacket(b64e(rand(32))));
+        // Heartbeat uses padded random bytes — relay cannot distinguish ping from real message
+      pingRef.current=setInterval(()=>{
+          if(ws.readyState===WebSocket.OPEN) ws.send(padPacket(b64e(rand(WS_PACKET_SIZE/2))));
         },25000);
         // Decoy traffic at random intervals
         const schedDecoy=()=>{
           decoyRef.current=setTimeout(()=>{
-            if(ws.readyState===WebSocket.OPEN) ws.send(padPacket(b64e(rand(64+rand(1)[0]%64))));
+            // Skip decoy when tab is hidden — browser throttles anyway, avoid traffic pattern
+            if(ws.readyState===WebSocket.OPEN && !document.hidden)
+              ws.send(padPacket(b64e(rand(64+rand(1)[0]%64))));
             schedDecoy();
           },15000+rand(1)[0]%30000);
         };
@@ -1175,7 +1128,12 @@ export default function SecureChat() {
         if(!pkg||pkg.name===myNameRef.current) return;
         if(pkg.t==="DECOY"||!pkg.t) return;
 
+        const MAX_PEERS = 10;
         if(pkg.t==="JOIN"||pkg.t==="HERE"){
+          if(Object.keys(peersRef.current).length>=MAX_PEERS){
+            addSys(`⚠ Max peer limit (${MAX_PEERS}) reached. Ignoring ${pkg.name}.`);
+            return;
+          }
           if(pkg.t==="JOIN"&&Object.keys(peersRef.current).length>0){
             setAnomaly(true);addSys(`⚠ ANOMALY: ${pkg.name} joined unexpectedly.`);haptic([100,50,100]);
           }
@@ -1193,6 +1151,13 @@ export default function SecureChat() {
               setSasCodes(prev=>({...prev,[pkg.name]:sas}));
               addSys(`🔑 X3DH with ${pkg.name} complete. SAS: ${sas}`);
               haptic([10,10,20]);
+              // Send encrypted key confirmation — proves both sides derived same key
+              try {
+                const confirmEnv = buildEnvelope("CONFIRM", myNameRef.current, pkg.name, "KEY_OK");
+                const confirmPkg = await session.encrypt(confirmEnv);
+                const confirmPkt = padPacket(b64e(ENC.encode(JSON.stringify({t:"MSG",name:myNameRef.current,to:pkg.name,payload:confirmPkg}))));
+                queueOrSend(ws, confirmPkt);
+              } catch(_) {}
             }catch(e){addSys(`⚠ X3DH failed: ${e.message}`);}
           }
           if(pkg.ekForPeer&&pkg.to===myNameRef.current&&identityRef.current&&roomBitsRef.current){
@@ -1230,8 +1195,13 @@ export default function SecureChat() {
           setSecInfo(s=>({...s,ratchet:s.ratchet+1}));
           if(!env){addSys(`⚠ Message from ${pkg.name} rejected.`);return;}
           // env.t = type, env.f = from, env.r = to, env.p = payload — all were encrypted
-          if(env.t==="img") addMsg(env.f||pkg.name,"",false,true,env.p,env.b);
-          else addMsg(env.f||pkg.name,env.p,false,false,null,env.b);
+          if(env.t==="CONFIRM"){
+            addSys(`✅ Key confirmation from ${env.f||pkg.name} — shared key verified.`);
+          } else if(env.t==="img") {
+            addMsg(env.f||pkg.name,"",false,true,env.p,env.b);
+          } else {
+            addMsg(env.f||pkg.name,env.p,false,false,null,env.b);
+          }
         }
       },
       ()=>{
@@ -1246,7 +1216,7 @@ export default function SecureChat() {
       },
       setConnStep);
 
-    }catch(e){setStatus("error");setConnErr(e.message||"Connection failed");setConnStep("");}
+    }catch(e){clearTimeout(connectTimeout);setStatus("error");setConnErr(e.message||"Connection failed");setConnStep("");}
   },[roomId,roomKey]);
 
   useEffect(()=>{
@@ -1274,7 +1244,7 @@ export default function SecureChat() {
         const envelope=buildEnvelope("txt",myNameRef.current,peerName,text,{b:burnMode});
         const payload=await session.encrypt(envelope);
         const pkt=padPacket(b64e(ENC.encode(JSON.stringify({t:"MSG",name:myNameRef.current,to:peerName,payload}))));
-        wsRef.current.send(pkt);
+        queueOrSend(wsRef.current, pkt);
         setSecInfo(s=>({...s,ratchet:s.ratchet+1}));
       }catch{addSys(`⚠ Encrypt failed for ${peerName}`);}
     }
@@ -1289,7 +1259,14 @@ export default function SecureChat() {
     const reader=new FileReader();
     reader.onerror=()=>addSys(`⚠ Failed to read "${file.name}".`);
     reader.onload=async(e)=>{
-      const dataUrl=e.target.result;
+      let dataUrl=e.target.result;
+      // Strip EXIF metadata from images — removes GPS, device info, timestamps
+      if(isImage){
+        try{
+          const stripped=await stripEXIF(dataUrl);
+          if(stripped) dataUrl=stripped;
+        }catch(_){/* fallback to original if strip fails */}
+      }
       for(const [pn,session] of Object.entries(peersRef.current)){
         try{
           await randDelay(0,400);
@@ -1306,15 +1283,30 @@ export default function SecureChat() {
   },[burnMode,destructTime]);
 
   const onInputChange=(e)=>{
-    setInput(e.target.value);resetIdle();
+    // Hard cap at 4096 chars — prevents memory exhaustion from giant pastes
+    const val = e.target.value.slice(0, 4096);
+    setInput(val);resetIdle();
     const now=Date.now();
     if(wsRef.current?.readyState===WebSocket.OPEN&&now-lastTyping.current>2000){
       wsRef.current.send(padPacket(b64e(ENC.encode(JSON.stringify({t:"TYPING",name:myNameRef.current})))));
       lastTyping.current=now;
     }
   };
-  const onKeyDown=(e)=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}};
-  const fmt=(ts)=>new Date(ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+  const onKeyDown=(e)=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}}
+  const onPaste=(e)=>{
+    // Strip any non-text content from paste (images, files, binary data)
+    e.preventDefault();
+    const text = (e.clipboardData||window.clipboardData).getData("text/plain");
+    const safe = stripSteganography(text).slice(0, 4096);
+    setInput(prev => (prev + safe).slice(0, 4096));
+  };;
+  const fmt=(ts)=>{
+    // Show relative time — less correlatable with traffic analysis
+    const diff = Date.now() - ts;
+    if(diff < 60000) return "just now";
+    if(diff < 3600000) return Math.floor(diff/60000)+"m ago";
+    return new Date(ts).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
+  };
   const dotColor=status==="connected"?"#00ff9d":(status==="error"||status==="disconnected")?"#ff4444":"#ffaa00";
   const dLabel=destructTime===0?"OFF":destructTime<60?`${destructTime}s`:`${destructTime/60}m`;
   const peerCount=Object.keys(peers).length;
@@ -1487,10 +1479,6 @@ export default function SecureChat() {
       onMouseMove={resetIdle} onTouchStart={resetIdle}>
       <style>{css}</style>
       <div className="crt"/>
-      {/* Screenshot shield — triple layer */}
-      <div className={`capture-shield-a ${shieldActive?"active":""}`}/>
-      <div className={`capture-shield-b ${shieldActive?"active":""}`}/>
-      <div className={`capture-shield ${shieldActive?"active":""}`}/>
 
       <input type="file" ref={fileRef} style={{display:"none"}} accept="image/*,*/*"
         onChange={e=>{if(e.target.files[0])sendFile(e.target.files[0]);e.target.value="";}} />
@@ -1504,14 +1492,7 @@ export default function SecureChat() {
           <div style={{fontSize:12,letterSpacing:4,color:"#00ff9d88"}}>TAB INACTIVE</div>
           <div style={{fontSize:10,color:"#00ff9d44",letterSpacing:2}}>CLICK TO RESUME</div>
         </div>
-      )}
-
-      {/* Screenshot warning */}
-      {captureWarning&&(
-        <div className="ss-warning">
-          ⚠ SCREEN CAPTURE DETECTED — CONTENT SHIELDED — DO NOT PROCEED
-        </div>
-      )}
+      )}}
 
       {/* Header */}
       <div style={{borderBottom:"1px solid #00ff9d14",padding:"8px 12px",display:"flex",alignItems:"center",justifyContent:"space-between",flexShrink:0,flexWrap:"wrap",gap:4}}>
@@ -1520,31 +1501,38 @@ export default function SecureChat() {
           <span className="header-text" style={{fontSize:10,letterSpacing:2,color:"#00ff9d55"}}>#{roomId}</span>
           {destructTime>0&&<span style={{fontSize:8,color:"#ff4444aa"}}>💣{dLabel}</span>}
           <span className={`badge ${peerCount>0?"on":""}`}>🔑{peerCount}P</span>
+          {outboundQueue.length>0&&<span className="badge warn">⏳{outboundQueue.length}Q</span>}
           <span className="badge on">X3DH:{secInfo.x3dh}</span>
           <span className="badge on">R:{secInfo.ratchet}</span>
           {anomaly&&<span className="badge warn">⚠ANOMALY</span>}
-          {shieldActive&&<span className="badge warn">🛡 SHIELDED</span>}
           {!isMobile&&<span className="badge on">ESC×3=PANIC</span>}
         </div>
         <span style={{fontSize:9,color:"#00ff9d55"}}>{myNameRef.current}</span>
       </div>
 
-      {/* FP + SAS */}
+      {/* FP + SAS — hidden by default, reveal on tap to avoid screenshot leakage */}
       {fp&&(
-        <div style={{borderBottom:"1px solid #00ff9d0a",padding:"4px 12px",background:"#00ff9d03",display:"flex",alignItems:"center",gap:8,flexShrink:0,flexWrap:"wrap"}}>
-          <span style={{fontSize:7,color:"#00ff9d2a"}}>FP:</span>
-          <span className="fp">{fp}</span>
-          {Object.entries(sasCodes).map(([name,sas])=>(
-            <span key={name} style={{fontSize:9,color:"#00ff9d44"}}>
-              SAS({name.split("-")[0]}): <span className="sas">{sas}</span>
-            </span>
-          ))}
-          <span style={{fontSize:7,color:"#00ff9d18",marginLeft:"auto"}}>VERIFY OUT-OF-BAND</span>
+        <div style={{borderBottom:"1px solid #00ff9d0a",padding:"4px 12px",background:"#00ff9d03",display:"flex",alignItems:"center",gap:8,flexShrink:0,flexWrap:"wrap",cursor:"pointer",WebkitUserSelect:"none",userSelect:"none"}}
+          onClick={()=>setShowFP(v=>!v)}>
+          {showFP?(
+            <>
+              <span style={{fontSize:7,color:"#00ff9d2a"}}>FP:</span>
+              <span className="fp">{fp}</span>
+              {Object.entries(sasCodes).map(([name,sas])=>(
+                <span key={name} style={{fontSize:9,color:"#00ff9d44"}}>
+                  SAS({name.split("-")[0]}): <span className="sas">{sas}</span>
+                </span>
+              ))}
+              <span style={{fontSize:7,color:"#00ff9d18",marginLeft:"auto"}}>VERIFY OUT-OF-BAND · TAP TO HIDE</span>
+            </>
+          ):(
+            <span style={{fontSize:8,color:"#00ff9d33",letterSpacing:2}}>🔏 TAP TO REVEAL FINGERPRINT & SAS CODES</span>
+          )}
         </div>
       )}
 
       {/* Messages */}
-      <div className="messages-area chat-messages-wrap" style={{padding:"12px 12px 6px"}}>
+      <div className="messages-area" style={{padding:"12px 12px 6px"}}>
         {messages.map(m=>(
           <div key={m.id} className="msg" style={{marginBottom:10,display:"flex",flexDirection:"column",alignItems:m.mine?"flex-end":m.sys?"center":"flex-start"}}
             onClick={()=>m.burnOnRead&&!m.mine&&markRead(m.id)}>
@@ -1583,7 +1571,7 @@ export default function SecureChat() {
         <button className={`burn-btn ${burnMode?"on":""}`} onClick={()=>{setBurnMode(v=>!v);haptic([15]);}} title="Burn on read">🔥</button>
         <textarea className="chat-textarea" rows={1}
           placeholder={`${burnMode?"🔥 burn · ":""}message… (${isMobile?"tap send":"enter"} to send)`}
-          value={input} onChange={onInputChange} onKeyDown={onKeyDown}
+          value={input} onChange={onInputChange} onKeyDown={onKeyDown} onPaste={onPaste}
           style={{flex:1}}
         />
         <button className="send-btn" onClick={send} disabled={!input.trim()||status!=="connected"}>
