@@ -26,7 +26,7 @@ try {
     addMeta("robots", "noindex, nofollow, noarchive, nosnippet");
     addMeta("Cache-Control", "no-store, no-cache, must-revalidate", "http-equiv");
     addMeta("Pragma", "no-cache", "http-equiv");
-    addMeta("Content-Security-Policy", "default-src 'self' 'unsafe-inline' wss:; upgrade-insecure-requests; block-all-mixed-content;", "http-equiv");
+    addMeta("Content-Security-Policy", "default-src 'self' 'unsafe-inline' ws: wss: blob: data:;", "http-equiv");
     addMeta("Strict-Transport-Security", "max-age=31536000; includeSubDomains", "http-equiv");
   } catch(_) {}
   // Page integrity fingerprint — detect JS injection by relay
@@ -102,7 +102,7 @@ try {
 //
 // TIER 4 — PHYSICAL SECURITY (device/session threats)
 //   L23 Panic key ESC×3                 Instant wipe on device seizure
-//   L24 Idle auto-lock 1 min            Unattended device protected
+//   L24 Idle auto-lock 5 min (input only, warns 60s before)   Unattended device protected
 //   L25 Session expiry 4h               Long-session attacks prevented
 //   L26 Burn-on-read                    Message deleted on first view
 //   L27 Self-destruct timer             Messages auto-wiped (10s–5min)
@@ -207,24 +207,25 @@ async function derivePQComponent(roomBits, context) {
   return hkdfBits(roomBits, "phantom-pq-v7", context + ":pq-hardening", 512);
 }
 
-async function x3dhInitiate(myId,theirBundle,roomBits){
-  const EK=await genKeypair();
-  const theirIK=await importPub(theirBundle.ik),theirSPK=await importPub(theirBundle.spk),theirOPK=await importPub(theirBundle.opk);
-  const [dh1,dh2,dh3,dh4]=await Promise.all([ecdhBits(myId.IK.privateKey,theirSPK),ecdhBits(EK.privateKey,theirIK),ecdhBits(EK.privateKey,theirSPK),ecdhBits(EK.privateKey,theirOPK)]);
-  // Post-quantum component — mixed in before master secret derivation
-  const pqComponent = await derivePQComponent(roomBits, "initiator");
+// Symmetric key agreement — BOTH peers derive the SAME master secret,
+// regardless of who "initiated". The four DH values are ordered by a
+// deterministic comparison of the two identity keys, so each side computes
+// the identical set (via its own private key + the peer's public key). This
+// makes peer sessions converge even when both sides join simultaneously
+// (the old initiator/responder X3DH broke there, and mixed a different
+// post-quantum context into each side's master secret).
+async function x3dhAgree(myId,theirBundle,roomBits){
+  const myIk=await exportPub(myId.IK),theirIk=theirBundle.ik;
+  const forward=myIk<=theirIk;
+  const theirIK=await importPub(theirIk),theirSPK=await importPub(theirBundle.spk),theirOPK=await importPub(theirBundle.opk);
+  const [dh1,dh2,dh3,dh4]=forward
+    ? await Promise.all([ecdhBits(myId.IK.privateKey,theirSPK),ecdhBits(myId.SPK.privateKey,theirIK),ecdhBits(myId.IK.privateKey,theirOPK),ecdhBits(myId.OPK.privateKey,theirIK)])
+    : await Promise.all([ecdhBits(myId.SPK.privateKey,theirIK),ecdhBits(myId.IK.privateKey,theirSPK),ecdhBits(myId.OPK.privateKey,theirIK),ecdhBits(myId.IK.privateKey,theirOPK)]);
+  const pqComponent = await derivePQComponent(roomBits, "shared");
   const ikm=concat(dh1,dh2,dh3,dh4,roomBits,pqComponent);
   [dh1,dh2,dh3,dh4].forEach(wipe);wipe(pqComponent);
   const ms=await hkdfBits(ikm,"phantom-x3dh-v7-pq","master-secret",512);wipe(ikm);
-  return{masterSecret:ms,ekPub:await exportPub(EK)};
-}
-async function x3dhRespond(myId,initBundle,roomBits){
-  const theirIK=await importPub(initBundle.ik),theirEK=await importPub(initBundle.ek);
-  const [dh1,dh2,dh3,dh4]=await Promise.all([ecdhBits(myId.SPK.privateKey,theirIK),ecdhBits(myId.IK.privateKey,theirEK),ecdhBits(myId.SPK.privateKey,theirEK),ecdhBits(myId.OPK.privateKey,theirEK)]);
-  const pqComponent = await derivePQComponent(roomBits, "responder");
-  const ikm=concat(dh1,dh2,dh3,dh4,roomBits,pqComponent);
-  [dh1,dh2,dh3,dh4].forEach(wipe);wipe(pqComponent);
-  const ms=await hkdfBits(ikm,"phantom-x3dh-v7-pq","master-secret",512);wipe(ikm);return ms;
+  return ms;
 }
 
 class RatchetChain {
@@ -259,9 +260,21 @@ function blockUnpad(s){try{const i=JSON.parse(JSON.parse(s).d);return{text:strip
 
 class PeerSession {
   constructor(){this.sendChain=null;this.recvChain=null;this.hmacKey=null;this.ready=false;this.seen=new Set();this.sendSeq=0;this.recvSeq=0;}
-  async _setup(ms){this.sendChain=new RatchetChain(ms.slice(0,32));this.recvChain=new RatchetChain(ms.slice(32,64));this.hmacKey=await hkdfHMAC(ms,"phantom-hmac-v7","auth");this.ready=true;}
-  async initAsInitiator(myId,theirBundle,roomBits){const{masterSecret:ms,ekPub}=await x3dhInitiate(myId,theirBundle,roomBits);await this._setup(ms);wipe(ms);return ekPub;}
-  async initAsResponder(myId,initBundle,roomBits){const ms=await x3dhRespond(myId,initBundle,roomBits);await this._setup(ms);wipe(ms);}
+  // Both peers must pick the SAME half of the master secret for send vs recv,
+  // or they'll each encrypt with a key the other never uses. The direction is
+  // keyed on a deterministic ordering of the two identity keys, so it agrees
+  // even when both sides initiate simultaneously (Signal X3DH has no such
+  // tie-break here — without it, peer messages always fail to decrypt).
+  async _setup(ms,myIk,theirIk){
+    const a=ms.slice(0,32),b=ms.slice(32,64);
+    const sendFirst = myIk <= theirIk;
+    this.sendChain=new RatchetChain(sendFirst?a:b);
+    this.recvChain=new RatchetChain(sendFirst?b:a);
+    this.hmacKey=await hkdfHMAC(ms,"phantom-hmac-v7","auth");
+    this.ready=true;
+  }
+  async initAsInitiator(myId,theirBundle,roomBits){const ms=await x3dhAgree(myId,theirBundle,roomBits);const myIk=await exportPub(myId.IK);await this._setup(ms,myIk,theirBundle.ik);wipe(ms);}
+  async initAsResponder(myId,theirBundle,roomBits){const ms=await x3dhAgree(myId,theirBundle,roomBits);const myIk=await exportPub(myId.IK);await this._setup(ms,myIk,theirBundle.ik);wipe(ms);}
   async encrypt(envelope){
     if(!this.ready)throw new Error("no session");
     this.sendSeq++;
@@ -316,16 +329,26 @@ const outboundQueue=[];
 function queueOrSend(ws,data){if(ws&&ws.readyState===WebSocket.OPEN)ws.send(data);else if(outboundQueue.length<50)outboundQueue.push(data);}
 async function flushQueue(ws){while(outboundQueue.length>0&&ws.readyState===WebSocket.OPEN)ws.send(outboundQueue.shift());}
 
-// WebSocket relays
-// Approved relay domains — warn user if connection goes elsewhere (BGP hijack indicator)
-const APPROVED_RELAY_DOMAINS = ["socketsbay.com","echo.websocket.events","ws.postman-echo.com"];
-const RELAYS=[ch=>`wss://socketsbay.com/wss/v2/1/${ch}/`,ch=>`wss://echo.websocket.events/phantom-${ch}`,ch=>`wss://ws.postman-echo.com/raw`];
+// ── WebSocket relay ─────────────────────────────────────────────────────────
+// The relay runs as a SEPARATE process on its own port (default 8787) so it is
+// a different origin / trust domain from the page host. It is a dumb, in-memory
+// broadcast relay that never logs, persists, or sees plaintext (relay-server.mjs).
+// Override the host/port at build time with VITE_RELAY_HOST / VITE_RELAY_PORT.
+const RELAY_HOST = (import.meta.env.VITE_RELAY_HOST || "localhost");
+const RELAY_PORT = (import.meta.env.VITE_RELAY_PORT || "8787");
+const RELAY_BASE = () =>
+  (location.protocol === "https:" ? "wss://" : "ws://") + RELAY_HOST + ":" + RELAY_PORT + "/relay/";
+const RELAYS = [ch => RELAY_BASE() + ch];
 async function connectWS(channel,onOpen,onMsg,onClose,setStep){
   for(let i=0;i<RELAYS.length;i++){
     const url=RELAYS[i](channel);
     // Domain pinning — detect BGP hijack / DNS poisoning
     const urlHost = new URL(url).hostname;
-    if(!APPROVED_RELAY_DOMAINS.includes(urlHost)){
+    const SELF_HOST = location.hostname;
+    const APPROVED_RELAY_DOMAINS = ["localhost","127.0.0.1","::1","[::1]"];
+    // The configured relay host is always allowed; anything else must be
+    // pre-approved (domain pinning — detect BGP hijack / DNS poisoning).
+    if(urlHost!==SELF_HOST&&urlHost!==RELAY_HOST&&!APPROVED_RELAY_DOMAINS.includes(urlHost)){
       console.error("SECURITY: Connection to unapproved domain blocked:", urlHost);
       continue;
     }
@@ -430,7 +453,12 @@ const css=`
 `;
 
 const DESTRUCT_OPTIONS=[0,10,30,60,300];
-const IDLE_MS=1*60*1000;
+// Auto-lock after TRUE inactivity (no input at all). Reading or waiting in the
+// room must NOT trigger it — previously 60s of no mouse movement nuked the
+// session mid-conversation.
+const IDLE_MS=5*60*1000;
+const IDLE_WARN_MS=60*1000; // visible countdown before auto-lock
+const RECONNECT_DELAY=5000;
 const EXPIRY_MS=4*60*60*1000;
 const NAME_ROTATE=50;
 
@@ -463,10 +491,13 @@ export default function SecureChat(){
   const [anomaly,setAnomaly]=useState(false);
   const [secInfo,setSecInfo]=useState({ratchet:0,x3dh:0});
   const [sessionExpired,setSessionExpired]=useState(false);
+  const [idleWarn,setIdleWarn]=useState(0);
   const [showFP,setShowFP]=useState(false);
   const [isMobile]=useState(()=>/iPhone|iPad|Android|Mobile/i.test(navigator.userAgent));
 
   const wsRef=useRef(null),bottomRef=useRef(null),pingRef=useRef(null),decoyRef=useRef(null);
+  const phaseRef=useRef(phase),connectRef=useRef(null),reconnectRef=useRef(null),livePeersRef=useRef(new Set());
+  useEffect(()=>{phaseRef.current=phase;},[phase]);
   const identityRef=useRef(null),roomBitsRef=useRef(null),peersRef=useRef({});
   const fileRef=useRef(null),cameraRef=useRef(null),lastTyping=useRef(0),lastActivity=useRef(Date.now());
   const idleRef=useRef(null),myNameRef=useRef(MY_NAME),msgCountRef=useRef(0);
@@ -481,7 +512,7 @@ export default function SecureChat(){
   },[destructTime]);
 
   useEffect(()=>{const onB=()=>setBlurred(true),onF=()=>setBlurred(false);window.addEventListener("blur",onB);window.addEventListener("focus",onF);return()=>{window.removeEventListener("blur",onB);window.removeEventListener("focus",onF);};},[]);
-  useEffect(()=>{const onV=()=>{if(document.hidden&&roomBitsRef.current){wipe(roomBitsRef.current);roomBitsRef.current=null;}};document.addEventListener("visibilitychange",onV);return()=>document.removeEventListener("visibilitychange",onV);},[]);
+  useEffect(()=>{const onV=()=>{if(document.hidden&&roomBitsRef.current&&!Object.keys(peersRef.current).length){wipe(roomBitsRef.current);roomBitsRef.current=null;}};document.addEventListener("visibilitychange",onV);return()=>document.removeEventListener("visibilitychange",onV);},[]);
 
   const resetIdle=useCallback(()=>{lastActivity.current=Date.now();},[]);
 
@@ -492,15 +523,30 @@ export default function SecureChat(){
     return()=>window.removeEventListener("beforeunload",onBefore);
   },[phase]);
 
+  // Auto-lock counts only REAL user input (keys / taps / clicks). Passive time
+  // — reading, waiting for a reply — never triggers it, and a visible countdown
+  // warns before it fires.
   useEffect(()=>{
     if(phase!=="chat")return;
-    idleRef.current=setInterval(()=>{if(Date.now()-lastActivity.current>IDLE_MS){setMessages([]);setInput("");setPhase("lock");setPStep(0);wsRef.current?.close();clearTimeout(decoyRef.current);}},10000);
+    const onAct=()=>{lastActivity.current=Date.now();};
+    window.addEventListener("keydown",onAct);
+    window.addEventListener("pointerdown",onAct);
+    document.addEventListener("touchstart",onAct,{passive:true});
+    return()=>{window.removeEventListener("keydown",onAct);window.removeEventListener("pointerdown",onAct);document.removeEventListener("touchstart",onAct);};
+  },[phase]);
+  useEffect(()=>{
+    if(phase!=="chat")return;
+    idleRef.current=setInterval(()=>{
+      const idleMs=Date.now()-lastActivity.current;
+      setIdleWarn(idleMs>IDLE_MS-IDLE_WARN_MS?Math.max(0,Math.ceil((IDLE_MS-idleMs)/1000)):0);
+      if(idleMs>IDLE_MS){setMessages([]);setInput("");setPhase("lock");phaseRef.current="lock";setPStep(0);setIdleWarn(0);wsRef.current?.close();clearTimeout(decoyRef.current);}
+    },1000);
     return()=>clearInterval(idleRef.current);
   },[phase]);
 
-  useEffect(()=>{if(phase!=="chat")return;const t=setTimeout(()=>{setSessionExpired(true);wsRef.current?.close();setMessages([]);setPhase("lock");setPStep(0);},EXPIRY_MS);return()=>clearTimeout(t);},[phase]);
+  useEffect(()=>{if(phase!=="chat")return;const t=setTimeout(()=>{setSessionExpired(true);phaseRef.current="lock";wsRef.current?.close();setMessages([]);setPhase("lock");setPStep(0);},EXPIRY_MS);return()=>clearTimeout(t);},[phase]);
 
-  useEffect(()=>{let times=[];const onK=(e)=>{if(e.key!=="Escape")return;const now=Date.now();times=[...times.filter(t=>now-t<2000),now];if(times.length>=3){setMessages([]);setInput("");if(roomBitsRef.current)wipe(roomBitsRef.current);peersRef.current={};setPeers({});wsRef.current?.close();clearTimeout(decoyRef.current);setPhase("lock");setPStep(0);times=[];}};window.addEventListener("keydown",onK);return()=>window.removeEventListener("keydown",onK);},[]);
+  useEffect(()=>{let times=[];const onK=(e)=>{if(e.key!=="Escape")return;const now=Date.now();times=[...times.filter(t=>now-t<2000),now];if(times.length>=3){setMessages([]);setInput("");if(roomBitsRef.current)wipe(roomBitsRef.current);peersRef.current={};setPeers({});wsRef.current?.close();clearTimeout(decoyRef.current);setPhase("lock");phaseRef.current="lock";setPStep(0);times=[];}};window.addEventListener("keydown",onK);return()=>window.removeEventListener("keydown",onK);},[]);
 
   useEffect(()=>{if(lockCooldown<=0)return;const t=setTimeout(()=>setLockCooldown(c=>Math.max(0,c-1)),1000);return()=>clearTimeout(t);},[lockCooldown]);
 
@@ -528,11 +574,25 @@ export default function SecureChat(){
     }
   };
 
+  // Auto-reconnect: when the socket drops (relay restart, network blip) the
+  // app rejoins the SAME room automatically. X3DH re-runs from fresh Signal
+  // keys with every peer, so session security is fully preserved. It stops
+  // only when the user locks, panics, or exits the room.
+  const scheduleReconnect=useCallback(()=>{
+    if(reconnectRef.current||phaseRef.current!=="chat")return;
+    reconnectRef.current=setTimeout(()=>{
+      reconnectRef.current=null;
+      if(phaseRef.current==="chat"&&(!wsRef.current||wsRef.current.readyState>1))connectRef.current?.();
+    },RECONNECT_DELAY);
+  },[]);
+
   const connect=useCallback(async()=>{
     if(!roomId.trim()||roomKey.length<6)return;
+    if(wsRef.current&&wsRef.current.readyState<=1){addSys("Already connected.");return;}
+    clearTimeout(reconnectRef.current);reconnectRef.current=null;
     setStatus("connecting");setConnErr("");
     const didConnect={current:false};
-    const connectTimeout=setTimeout(()=>{if(!didConnect.current){setStatus("error");setConnErr("Connection timed out after 30s.");setConnStep("");}},30000);
+    const connectTimeout=setTimeout(()=>{if(!didConnect.current){setStatus("error");setConnErr("Connection timed out after 30s.");setConnStep("");scheduleReconnect();}},30000);
     peersRef.current={};setPeers({});setSasCodes({});setSecInfo({ratchet:0,x3dh:0});
     try{
       setConnStep("Generating Signal keys (IK, SPK, OPK)…");
@@ -555,20 +615,27 @@ export default function SecureChat(){
       setConnStep("Connecting to relay…");
       const channel=await hashRoom(roomId.trim());
       const randPath=b64e(rand(8)).replace(/[+/=]/g,"").slice(0,8).toLowerCase();
-      const ws=await connectWS(channel+randPath,(ws)=>{
-        wsRef.current=ws;didConnect.current=true;clearTimeout(connectTimeout);
-        setStatus("connected");setPhase("chat");flushQueue(ws);
+      // The randPath is a SEPARATE path segment: the relay routes the room on
+      // the first segment (the room hash), so each side can pick a different
+      // random suffix without splitting the room.
+      const ws=await connectWS(channel+"/"+randPath,(ws)=>{wsRef.current=ws;didConnect.current=true;clearTimeout(connectTimeout);setStatus("connected");setIdleWarn(0);setPhase("chat");phaseRef.current="chat";lastActivity.current=Date.now();flushQueue(ws);
         addSys("🔐 Phantom v7 — Signal X3DH + Triple AES-256-GCM active.");
-        addSys("⚡ ESC×3 = panic wipe · 1min idle = auto-lock");
+        addSys("⚡ ESC×3 = panic wipe · 5min inactivity = auto-lock (with warning)");
         identityRef.current.exportBundle().then(bundle=>{
           ws.send(padPacket(b64e(ENC.encode(JSON.stringify({t:"JOIN",name:myNameRef.current,bundle})))));
         });
         let lastPong=Date.now();
         ws.addEventListener("message",()=>{lastPong=Date.now();});
+        // Liveness = TCP health (outbound ping + any inbound reply). The relay
+        // never echoes our own packets back, so inbound silence is NORMAL while
+        // alone in a room or when every peer is idle — closing on it used to
+        // disconnect anyone waiting alone for more than a minute.
         pingRef.current=setInterval(()=>{
-          if(ws.readyState===WebSocket.OPEN){
-            ws.send(padPacket(b64e(rand(WS_PACKET_SIZE/2))));
-            if(Date.now()-lastPong>60000){addSys("⚠ Stale connection — reconnecting…");ws.close();}
+          if(ws.readyState!==WebSocket.OPEN)return;
+          ws.send(padPacket(b64e(rand(WS_PACKET_SIZE/2))));
+          if(Date.now()-lastPong>65000){
+            const knownPeers=Object.keys(peersRef.current).length+livePeersRef.current.size;
+            if(knownPeers>0){addSys("⚠ Relay unreachable — reconnecting…");ws.close();}
           }
         },25000);
         const schedDecoy=()=>{
@@ -596,21 +663,30 @@ export default function SecureChat(){
         if(!ws._rw){ws._rw=now;ws._rc=0;}
         if(now-ws._rw>1000){ws._rw=now;ws._rc=0;}
         ws._rc++;if(ws._rc>30)return;
-        const raw=unpadPacket(evt.data);if(!raw)return;
+        // Normalize frame payload: some clients/relays deliver Blob/ArrayBuffer.
+        let payload;
+        if(typeof evt.data==="string")payload=evt.data;
+        else if(evt.data instanceof Blob)payload=await evt.data.text();
+        else payload=DEC.decode(evt.data);
+        const raw=unpadPacket(payload);if(!raw)return;
         let pkg;try{pkg=JSON.parse(DEC.decode(b64d(raw)));}catch{return;}
         if(!pkg||pkg.name===myNameRef.current)return;
         if(pkg.t==="DECOY"||!pkg.t)return;
         const MAX_PEERS=10;
         if((pkg.t==="JOIN"||pkg.t==="HERE")&&Object.keys(peersRef.current).length>=MAX_PEERS){addSys(`⚠ Max peers reached. Ignoring ${pkg.name}.`);return;}
         if(pkg.t==="JOIN"||pkg.t==="HERE"){
+          // Liveness beacon: this peer was reachable just now. Lets the stale
+          // check distinguish "alone/dead room" (fine) from "relay is gone".
+          livePeersRef.current.add(pkg.name);
+          setTimeout(()=>livePeersRef.current.delete(pkg.name),60000);
           if(pkg.t==="JOIN"&&Object.keys(peersRef.current).length>0){setAnomaly(true);addSys(`⚠ ANOMALY: ${pkg.name} joined mid-session.`);haptic([100,50,100]);}
           if(pkg.bundle&&identityRef.current&&roomBitsRef.current){
             try{
               const session=new PeerSession();
-              const ekPub=await session.initAsInitiator(identityRef.current,pkg.bundle,roomBitsRef.current);
+              await session.initAsInitiator(identityRef.current,pkg.bundle,roomBitsRef.current);
               peersRef.current[pkg.name]=session;setPeers(p=>({...p,[pkg.name]:true}));setSecInfo(s=>({...s,x3dh:s.x3dh+1}));
               const myBundle=await identityRef.current.exportBundle();
-              ws.send(padPacket(b64e(ENC.encode(JSON.stringify({t:"HERE",name:myNameRef.current,bundle:myBundle,ekForPeer:{ik:myBundle.ik,ek:ekPub},to:pkg.name})))));
+              ws.send(padPacket(b64e(ENC.encode(JSON.stringify({t:"HERE",name:myNameRef.current,bundle:myBundle,to:pkg.name})))));
               const sas=await computeSAS(roomId,roomKey,myBundle.ik,pkg.bundle.ik);
               setSasCodes(prev=>({...prev,[pkg.name]:sas}));
               addSys(`🔑 X3DH with ${pkg.name} complete.`);
@@ -620,8 +696,8 @@ export default function SecureChat(){
               try{const ce=buildEnvelope("CONFIRM",myNameRef.current,pkg.name,"KEY_OK");const cp=await session.encrypt(ce);ws.send(padPacket(b64e(ENC.encode(JSON.stringify({t:"MSG",name:myNameRef.current,to:pkg.name,payload:cp})))));}catch(_){}
             }catch(e){addSys(`⚠ X3DH failed: ${e.message}`);}
           }
-          if(pkg.ekForPeer&&pkg.to===myNameRef.current&&identityRef.current&&roomBitsRef.current){
-            try{if(!peersRef.current[pkg.name]){const session=new PeerSession();await session.initAsResponder(identityRef.current,pkg.ekForPeer,roomBitsRef.current);peersRef.current[pkg.name]=session;setPeers(p=>({...p,[pkg.name]:true}));setSecInfo(s=>({...s,x3dh:s.x3dh+1}));const myBundle=await identityRef.current.exportBundle();const sas=await computeSAS(roomId,roomKey,myBundle.ik,pkg.bundle?.ik||pkg.ekForPeer.ik);setSasCodes(prev=>({...prev,[pkg.name]:sas}));addSys(`🔑 X3DH with ${pkg.name} (responder). SAS: ${sas}`);}}catch(e){addSys(`⚠ X3DH respond failed: ${e.message}`);}
+          if(pkg.bundle&&pkg.to===myNameRef.current&&identityRef.current&&roomBitsRef.current){
+            try{if(!peersRef.current[pkg.name]){const session=new PeerSession();await session.initAsResponder(identityRef.current,pkg.bundle,roomBitsRef.current);peersRef.current[pkg.name]=session;setPeers(p=>({...p,[pkg.name]:true}));setSecInfo(s=>({...s,x3dh:s.x3dh+1}));const myBundle=await identityRef.current.exportBundle();const sas=await computeSAS(roomId,roomKey,myBundle.ik,pkg.bundle.ik);setSasCodes(prev=>({...prev,[pkg.name]:sas}));addSys(`🔑 X3DH with ${pkg.name} (responder). SAS: ${sas}`);}}catch(e){addSys(`⚠ X3DH respond failed: ${e.message}`);}
           }
           if(pkg.t==="JOIN")addSys(`${pkg.name} joined.`);
         }else if(pkg.t==="LEAVE"){delete peersRef.current[pkg.name];setPeers(p=>{const n={...p};delete n[pkg.name];return n;});setTypingPeers(p=>{const n=new Set(p);n.delete(pkg.name);return n;});setSasCodes(p=>{const n={...p};delete n[pkg.name];return n;});addSys(`${pkg.name} left.`);
@@ -638,12 +714,13 @@ export default function SecureChat(){
           else addMsg(parsed.f||pkg.name,parsed.p,false,false,null,parsed.b);
         }
       },
-      ()=>{clearInterval(pingRef.current);clearTimeout(decoyRef.current);lastTyping.current=0;peersRef.current={};setPeers({});setSasCodes({});setStatus("disconnected");addSys("Disconnected.");},
+      ()=>{clearInterval(pingRef.current);clearTimeout(decoyRef.current);clearTimeout(reconnectRef.current);reconnectRef.current=null;lastTyping.current=0;peersRef.current={};livePeersRef.current=new Set();setPeers({});setSasCodes({});setStatus("disconnected");addSys("Disconnected.");scheduleReconnect();},
       setConnStep);
-    }catch(e){clearTimeout(connectTimeout);setStatus("error");setConnErr(e.message||"Connection failed");setConnStep("");}
-  },[roomId,roomKey]);
+    }catch(e){clearTimeout(connectTimeout);setStatus("error");setConnErr(e.message||"Connection failed");setConnStep("");if(phaseRef.current==="chat")scheduleReconnect();}
+  },[roomId,roomKey,scheduleReconnect]);
+  useEffect(()=>{connectRef.current=connect;},[connect]);
 
-  useEffect(()=>{return()=>{clearInterval(pingRef.current);clearTimeout(decoyRef.current);if(wsRef.current?.readyState===WebSocket.OPEN){wsRef.current.send(padPacket(b64e(ENC.encode(JSON.stringify({t:"LEAVE",name:myNameRef.current})))));wsRef.current.close();}if(roomBitsRef.current)wipe(roomBitsRef.current);};},[]);
+  useEffect(()=>{return()=>{clearInterval(pingRef.current);clearTimeout(reconnectRef.current);reconnectRef.current=null;clearTimeout(decoyRef.current);if(wsRef.current?.readyState===WebSocket.OPEN){wsRef.current.send(padPacket(b64e(ENC.encode(JSON.stringify({t:"LEAVE",name:myNameRef.current})))));wsRef.current.close();}if(roomBitsRef.current)wipe(roomBitsRef.current);};},[]);
 
   const stripEXIF=useCallback((dataUrl)=>new Promise((resolve,reject)=>{const img=new Image();img.onload=()=>{try{const canvas=document.createElement("canvas");canvas.width=img.naturalWidth;canvas.height=img.naturalHeight;const ctx=canvas.getContext("2d");ctx.fillStyle="#000";ctx.fillRect(0,0,canvas.width,canvas.height);ctx.drawImage(img,0,0);resolve(canvas.toDataURL("image/jpeg",0.92));}catch(e){reject(e);}};img.onerror=reject;img.src=dataUrl;}),[]);
 
@@ -815,6 +892,7 @@ export default function SecureChat(){
           {outboundQueue.length>0&&<span className="badge warn">⏳{outboundQueue.length}Q</span>}
           {anomaly&&<span className="badge warn">⚠ANOMALY</span>}
           {!isMobile&&<span className="badge on">ESC×3=PANIC</span>}
+          {idleWarn>0&&<span className="badge warn">💤LOCK IN {idleWarn}s — PRESS ANY KEY</span>}
         </div>
         <span style={{fontSize:9,color:"#00ff9d55"}}>{myNameRef.current}</span>
       </div>
